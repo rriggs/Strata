@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import collections
 import json
+import os
+import shutil
 import sys
 import time
 import urllib.parse
+import uuid
 import urllib.request
 from pathlib import Path
 
@@ -28,10 +31,11 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
-
 import serve.server as S  # noqa: E402
 import serve.telemetry as T  # noqa: E402
 from xe_telemetry import _XeGpu  # noqa: E402
+
+MOUNT = Path(os.environ.get("STRATA_SYCL_ROOT") or ROOT.parent)   # what strata-sycl.sh mounts at /work
 
 
 def install_xe_reader():
@@ -244,6 +248,57 @@ def install_logprobs():
     S.openai_collect = openai_collect
 
 
+def install_embeddings_path(cfg_path: str | None = None):
+    """The image encoder runs on the host, the engine in a container. Two mount layouts exist: strata-sycl.sh maps
+    the repo's parent (or STRATA_SYCL_ROOT) at /work, so a GENI path must become /work/... and the file be written
+    under that root; a deployment that runs the engine directly with same-path mounts (the B70 container mounts
+    /data/models at /data/models) needs neither. The config's "sycl_root" key (written by setup only for the
+    /work layout, and the engine's exe the wrapper script) tells the two apart; without one, nothing changes."""
+    cfg = {}
+    if cfg_path:
+        try:
+            cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            pass
+    if Path(cfg.get("exe") or "").name != "strata-sycl.sh" or not cfg.get("sycl_root"):
+        return
+    root = Path(cfg["sycl_root"]).resolve()
+
+    combined = S.combined_embeddings_path
+
+    def combined_in_mount(vision_dir: Path, nbytes: int):
+        d = root / "strata-vision"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(d).free > 2 * nbytes + (16 << 20):
+                return d / f"req-{uuid.uuid4().hex[:12]}.sve"
+        except OSError:
+            pass
+        return combined(vision_dir, nbytes)
+    S.combined_embeddings_path = combined_in_mount
+
+    Eng = S.StrataEngine
+    gen, gen_batched = Eng.generate, Eng.generate_batched
+
+    def remap(self, embeddings):
+        if not embeddings:
+            return embeddings
+        p = Path(embeddings)
+        try:
+            rel = p.resolve().relative_to(root)
+        except (ValueError, OSError):
+            return embeddings        # not under the mount: the engine's read of it fails and says so
+        return "/work/" + rel.as_posix()
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        return gen(self, ids, max_new, sampling, cancel, embeddings=remap(self, embeddings))
+    Eng.generate = generate
+
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+        return gen_batched(self, ids, max_new, sampling, cancel, embeddings=remap(self, embeddings))
+    Eng.generate_batched = generate_batched
+
+
 def install_narrator():
     """The start narrator of serve/server.py says the CUDA engine's thing - tens of GB read into RAM, "YOUR PC CAN BE
     SLOW OR STOP RESPONDING" - at the experts' step. With --stream-experts the SYCL port reads them from the GGUF
@@ -306,9 +361,15 @@ def top_logprobs(req: dict):
     return None
 
 
+def arg(name: str, default=None):
+    argv = sys.argv[1:]
+    return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else default
+
+
 if __name__ == "__main__":
     install_xe_reader()
     install_narrator()
     install_switcher(sys.argv[1:])
     install_logprobs()
+    install_embeddings_path(arg("--config"))
     sys.exit(S.main())

@@ -2,8 +2,15 @@
 # the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
 #
 #   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
-#         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native] [-DSTRATA_PORTABLE=OFF]
+#         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native] [-DSTRATA_VISION_SYCL=ON]
+#         [-DSTRATA_PORTABLE=OFF]
 #   cmake --build build-vision --target strata-vision
+#
+# STRATA_VISION_SYCL=ON (Intel Arc, the SYCL port, docs/INTEL_ARC.md) builds ggml-sycl: build with Intel's oneAPI
+# compilers (-DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx) after sourcing setvars.sh.  mtmd's use_gpu picks
+# whatever GPU backend is linked in, so the same --gpu flag selects the SYCL encoder.  Measured on an Arc Pro B70
+# (mmproj BF16, a 294-token picture): ~0.1-0.15 s on the GPU against ~1 s on a 7950X at 16 CPU threads; the peak
+# VRAM sampled beside a running engine was ~2.1 GiB, so the engine's --vram-reserve-mib should be ~2300.
 #
 # Portable (AVX2 baseline) is the default, so an encoder built without extra flags runs on any AVX2 PC: the 0.1.32
 # release's encoder was built native on an AVX-512 machine and stopped with an illegal instruction elsewhere
@@ -14,6 +21,7 @@ project(strata_vision C CXX)
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
 option(STRATA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
+option(STRATA_VISION_SYCL "run the vision encoder on an Intel GPU (builds ggml-sycl; build with icx/icpx)" OFF)
 option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" ON)
 if(STRATA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
@@ -52,6 +60,10 @@ else()
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA ${STRATA_VISION_CUDA} CACHE BOOL "" FORCE)
+set(GGML_SYCL ${STRATA_VISION_SYCL} CACHE BOOL "" FORCE)
+if(STRATA_VISION_SYCL)
+  message(STATUS "strata-vision: SYCL build (ggml-sycl; build with Intel oneAPI's icx/icpx)")
+endif()
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 
