@@ -12,7 +12,7 @@ outside.
 Written for and measured on an **Arc Pro B70 (32 GB)** running the Coder (IQ1_M) on Ubuntu 24.04, in a
 PCIe 3.0 x8 slot (the card trains at Gen3 x8 there; it can do Gen5 x16).
 
-## What you get (2026-10-01)
+## What you get (2026-10-14)
 
 | | NVIDIA (Strata engine) | Intel Arc, Strata SYCL port | Intel Arc, llama.cpp |
 |---|---|---|---|
@@ -23,7 +23,7 @@ PCIe 3.0 x8 slot (the card trains at Gen3 x8 there; it can do Gen5 x16).
 | decode, Coder IQ1_M | 44-51 tok/s on an RTX 5070 | **78.2 tok/s** (19-token prompt, 256 greedy tokens), **75.7** after a 2,184-token prompt, 69 after 40K, 66.6 after 128K, 55.9 after 256K; 48-72 through the API | 23-25 tok/s |
 | prompt reading | ~1,870 tok/s | **790 tok/s** at 2,184 tokens, 1,117 at 40K, 888 at 128K, 757 at 256K | ~150 tok/s (424 at 105K) |
 | speculative decoding (MTP) | yes | yes (the base checkpoint's draft layer; 70-85% of drafts accepted on code) | no |
-| images | yes | not yet | not yet |
+| images | yes | **yes** (the encoder on the GPU: `--vision gpu`; 294-token picture in ~0.15-0.19 s against ~1 s on 16 CPU threads; measured on the B70) | not yet |
 | context | up to 262K | 256K measured, 56 tok/s decode there (`--kv-resident`: the KV in pinned host memory, the attended window in VRAM) | 131K measured ceiling |
 
 Decode speed with speculative decoding depends on the text: code drafts well, prose less so (see "Speed depends
@@ -58,7 +58,15 @@ setup.py itself is unchanged). The model choice, download, pack, tokenizer, MTP 
 questions are setup's own. What changes:
 
 - **GPU check:** the Arc is found in sysfs (vendor 8086 under `xe` or `i915`) and offered through setup's AMD
-  path. That is the path that builds locally and has no images.
+  path. That is the path that builds locally.
+- **Images (`--vision`):** setup asks where the encoder runs. `cpu` builds `tools/vision` for the CPU as before.
+  `gpu` (`--vision gpu` or answering yes) builds it with **SYCL** (`tools/vision`'s `STRATA_VISION_SYCL`, icx/icpx —
+  oneAPI's compilers must be on the `PATH`; without them setup warns and falls back to the CPU encoder), and writes
+  `--vram-reserve-mib 2300` unless you gave a reserve: the GPU encoder measured ~2.1 GiB of VRAM beside a running
+  engine on the B70 (mmproj BF16, warm-up to 4,096 image tokens included). Measured on the B70 beside a running
+  engine: a 294-token picture in 0.15-0.19 s on the GPU against ~1 s at 16 CPU threads, embeddings cosine 0.999
+  between the two; the encoder loads 12-21 s at server start (the warm-up). oneDNN must be off in the encoder build
+  (`-DGGML_SYCL_DNN=OFF`): the oneAPI-bundled `libdnnl` is not in the engine image.
 - **Engine step:** it uses the SYCL build (`build-sycl-aot/strata` or `build-sycl/strata`, run in the `strata-sycl-dev`
   image by `sycl/serve/strata-sycl.sh`) instead of compiling CUDA or HIP.
 - **RAM rule:** this does not apply on an `xe` card. The CUDA engine keeps every expert in RAM; the port streams them from
@@ -728,23 +736,11 @@ Measured on an Arc A750 (8 GB, `i915`, PCIe 4.0) with the Flash-Next IQ3_XXS in 
   1.3 s; the A750's PCIe link probes at 10.6 GB/s.
 - **A750 and the xe error counters.** The engine segfaults in a worker thread of the CPU pool when it exits (dmesg only, the server
   has already printed "stopped"); it is not a GPU event.
-- **The prompt's GDN recurrence runs a sub-group kernel on Alchemist** (`sycl/include/strata/prefill/gdn_xe.hpp`,
-  variant 6 of `gdn_recurrence_variant`). It keeps the column kernel's four row groups and their FMA chains in the same
-  order, but a 16-lane sub-group holds four columns x four row groups, so the two cross-row-group sums are sub-group
-  shuffles instead of SLM round trips and a token needs one work-group barrier instead of five (256 GRFs a thread).
-  Measured on an Arc A770 (16 GB, `xe`, oneAPI 2026.1 JIT), 2026-10-13: `gdn_parity --prefill-tokens 8192` 51.0 ->
-  24.5 ms, 32,768 tokens 204-236 -> 110-113 ms (48 heads), 0 mismatches; end to end, Coder IQ1_M, `--max-context
-  131072 --kv int8 --kv-resident 20480 --vram-reserve-mib 1200 --resident-experts`, prompt 386 -> 396-407 tok/s at
-  8K and 478-480 -> 511-518 tok/s at 32K, the same output tokens. On by default on Alchemist only, the column kernels everywhere else (not measured there). `STRATA_GDN_XE=0`
-  turns it off, `STRATA_GDN_XE=1` turns it on for any Intel GPU with 16-lane sub-groups. To check another Intel card:
-  `STRATA_GDN_XE=1 ./gdn_parity --selftest --prefill-only` (or `ctest -R prefill_gdn_parity`), and `--prefill-tokens
-  8192 --prefill-repeat 5` for the time of both kernels. Not taken: the same kernel with its state in SLM (no register
-  spills, the same bits, ~4x slower: 13.7 vs 3.1-3.3 ms at T=1000).
 
 ## Not done
 
-- Images, on both Intel engines. Strata's vision path encodes with `strata-vision` into embeddings the CUDA
-  engine reads; neither the SYCL port nor the llama.cpp config wires it yet.
+- Images on the llama.cpp path (the GGUF carries no mmproj llama.cpp's CLI can use). The SYCL port has images: the
+  encoder on the CPU (`--vision cpu`) or on the GPU (`--vision gpu`, `tools/vision`'s SYCL build), see "Setup" above.
 - Speculative decoding on the llama.cpp path (the GGUF carries no draft layer llama.cpp can use). The SYCL
   port has it (MTP draft layer, `--mtp`).
 
