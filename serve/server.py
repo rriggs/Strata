@@ -1828,6 +1828,13 @@ class StrataEngine:
             h = self.slot_held[b]
             if not h:
                 return 0
+            # #2518: a slot whose held tokens are exactly this prompt is not a prefix match - the conversation
+            # is unchanged and the slot's held array is just a current-state snapshot, not something worth
+            # keeping free for a next turn.  Without this guard, the common-prefix path below would treat
+            # [1,2,3] held vs [1,2,3] prompt as a 2-token match and shadow the empty slot.  (carried from
+            # the original `len(h) < len(prompt)` check, which the #1906 rewrite dropped.)
+            if h == prompt[:len(h)] and len(h) >= len(prompt):
+                return 0
             if len(h) < len(prompt) and prompt[:len(h)] == h:
                 return len(h)
             # #1906: a client's next turn sends the history back without the reply's thinking, so the slot's tokens
