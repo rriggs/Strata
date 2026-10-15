@@ -7817,15 +7817,19 @@ int main(int argc, char **argv) try {
                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
             }
             if (slot_checks_mirror != nullptr) {
-                // the slot's own copy: the main list is cleared by the next admission (the state itself was
-                // saved out of this slot's session during the read, so the copy is the whole checkpoint).
-                // Build m BEFORE the push_back(std::move(c)) below - c is moved-from after that line and its
-                // ids/imgs are unspecified, so mirroring c here would store empty checkpoints that can never
-                // prefix-match a prompt.
+                // the slot's own copy: the main list is cleared by the next admission (in this loop, another
+                // BGEN's slot_source path or the next read's slot-source check; on a single-threaded read the
+                // main list survives, but the carry-all refills sl.checks from it on cont==true and wipes the
+                // mirror's contributions via sl=BSlot{}, so the mirror is load-bearing only for the cont==false
+                // path: request completes in solo, slot stays cached, and the next turn resumes from one of
+                // these).  Build m BEFORE the push_back(std::move(c)) below - c is moved-from after that line
+                // and its ids/imgs are unspecified, so mirroring c here would store empty checkpoints that
+                // can never prefix-match a prompt.
                 ConvCheckpoint m;
                 m.ids = c.ids;
                 m.imgs = c.imgs;
                 m.used = c.used;
+                m.pinned = c.pinned;   // the carry-all path copies c wholesale; the mirror path has to set each field explicitly
                 if (!checkpoint_save(m, ss, g)) return false;
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
@@ -7837,6 +7841,23 @@ int main(int argc, char **argv) try {
                 const int64_t mirror_len = m.ids.size();
                 const size_t mirror_count = slot_checks_mirror->size() + 1;
                 slot_checks_mirror->push_back(std::move(m));
+                // #1906: cap the slot's mirrored list at prompt_cache (same as the main list). Without this,
+                // a long prompt with periodic checkpoints grows slot.checks beyond cap and the entries persist
+                // until the next BADM/BYIELD reset -- on cont==false (slot completes in solo), indefinitely.
+                while ((int) slot_checks_mirror->size() > o.prompt_cache) {
+                    std::vector<uint64_t> stamps;
+                    std::vector<char> is_tail;
+                    stamps.reserve(slot_checks_mirror->size());
+                    for (const ConvCheckpoint& k : *slot_checks_mirror) {
+                        stamps.push_back(k.used);
+                        is_tail.push_back(0);   // the tail flag is the main session's; the slot list has no tail
+                    }
+                    std::unique_ptr<bool[]> tail_flags(new bool[is_tail.size()]);
+                    for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = false;
+                    const size_t victim = strata::program::conv_cache::eviction_victim(
+                        stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get());
+                    slot_checks_mirror->erase(slot_checks_mirror->begin() + (std::ptrdiff_t) victim);
+                }
                 if (std::getenv("STRATA_RESUME_TRACE") != nullptr)
                     std::fprintf(stderr, "strata resume-trace: mirrored ck %lld into the slot (%zu checks)\n",
                                  (long long) mirror_len, mirror_count);
@@ -11768,11 +11789,23 @@ int main(int argc, char **argv) try {
                     // #1906: keep EVERY checkpoint that prefixes the conversation, not just the longest: the
                     // message boundary between a shared context and the question is what a later request
                     // branching inside this conversation resumes from; the longest (the turn) alone diverges
-                    // before it and is useless to that request.
-                    for (const ConvCheckpoint& c : checks)
-                        if (!sl.img && c.ids.size() < live.size() &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
-                            sl.checks.push_back(c);
+                    // before it and is useless to that request.  Gated on the message-boundary env (same as
+                    // the scan and the mirror) so the default launch keeps the upstream "one best checkpoint"
+                    // shape -- with it off, a slot otherwise grows up to --prompt_cache (default 6) copies
+                    // of every prefix-matchable checkpoint, for no reuse gain.
+                    if (message_boundary_opt_in()) {
+                        for (const ConvCheckpoint& c : checks)
+                            if (!sl.img && c.ids.size() < live.size() &&
+                                std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                                sl.checks.push_back(c);
+                    } else {
+                        const ConvCheckpoint* best = nullptr;
+                        for (const ConvCheckpoint& c : checks)
+                            if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
+                                std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                                best = &c;
+                        if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    }
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
