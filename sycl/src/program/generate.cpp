@@ -9875,6 +9875,12 @@ int main(int argc, char **argv) try {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
+            // #2566 review E: a slot's checkpoint is a resume point only with one stage part per stage.  copy_from_slot
+            // refuses a short set ("a checkpoint without its stage parts") and the caller then re-reads the whole prompt,
+            // throwing away the slot's own end as well; carried into the main `checks` list instead, the same entry
+            // trips the fatal restore below (c->stage_parts.size() != stages.size()).  Every checkpoint a read takes is
+            // saved per stage (checkpoint_at, the mirror, split/merge), so never select or carry a short set.
+            const auto ck_complete = [&](const ConvCheckpoint& c) { return c.stage_parts.size() == stages.size(); };
             if (o.prompt_cache > 0 && req_imgs.empty())
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
@@ -9885,7 +9891,8 @@ int main(int argc, char **argv) try {
                         slot_ck = nullptr;
                     }
                     for (const ConvCheckpoint& c : sl.checks)
-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                        if (ck_complete(c) && (int64_t) c.ids.size() > std::max(resume, slot_tokens) &&
+                            starts_with(c.ids, c.imgs)) {
                             slot_source = b;
                             slot_tokens = (int64_t) c.ids.size();
                             slot_ck = &c;
@@ -9943,7 +9950,8 @@ int main(int argc, char **argv) try {
                     bool took_checks = false;
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
-                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
+                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks)
+                            if (ck_complete(c)) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
                         took_checks = true;
                     }
@@ -9960,7 +9968,8 @@ int main(int argc, char **argv) try {
                         // history again.
                         if (!took_checks)
                             for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks)
-                                if (c.ids.size() < live.size() && std::equal(c.ids.begin(), c.ids.end(), live.begin())) {
+                                if (ck_complete(c) && c.ids.size() < live.size() &&
+                                    std::equal(c.ids.begin(), c.ids.end(), live.begin())) {
                                     checks.push_back(c);
                                     checks.back().used = ++check_clock;
                                 }
@@ -10494,7 +10503,8 @@ int main(int argc, char **argv) try {
                             sl.partial_from0 = read_from == 0 || resumed_from0;
                             sl.cvec = cvec_cached;
                             for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
-                                if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
+                                if (ck_complete(c) && (int64_t) c.ids.size() <= q &&
+                                    std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
                                         [](int32_t x, int64_t y) { return (int64_t) x == y; }))
                                     sl.checks.push_back(c);
                             yielded_at = q;
