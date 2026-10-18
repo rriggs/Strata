@@ -1670,6 +1670,20 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     std::_Exit(code);
 }
 
+namespace {
+    // #1906, #2518: the slot-checkpoint mirror and the carry-all admission both depend on the message-boundary
+    // checkpoint (#857) being there to find the common prefix. Both are gated on the same env var as that scan
+    // (STRATA_CACHE_MESSAGE_BOUNDARY=1) so they are no-ops on a default launch: each slot otherwise accumulates
+    // up to --prompt_cache checkpoint copies.
+    inline bool message_boundary_opt_in() {
+        static const bool on = [] {
+            const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        return on;
+    }
+}
+
 int main(int argc, char **argv) try {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -7802,10 +7816,12 @@ int main(int argc, char **argv) try {
             } else if (L == tail_ckpt_len) {
                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
             }
-            checks.push_back(std::move(c));
             if (slot_checks_mirror != nullptr) {
                 // the slot's own copy: the main list is cleared by the next admission (the state itself was
-                // saved out of this slot's session during the read, so the copy is the whole checkpoint)
+                // saved out of this slot's session during the read, so the copy is the whole checkpoint).
+                // Build m BEFORE the push_back(std::move(c)) below - c is moved-from after that line and its
+                // ids/imgs are unspecified, so mirroring c here would store empty checkpoints that can never
+                // prefix-match a prompt.
                 ConvCheckpoint m;
                 m.ids = c.ids;
                 m.imgs = c.imgs;
@@ -7818,11 +7834,14 @@ int main(int argc, char **argv) try {
                     if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
                     m.stage_parts.push_back(std::move(part));
                 }
+                const int64_t mirror_len = m.ids.size();
+                const size_t mirror_count = slot_checks_mirror->size() + 1;
                 slot_checks_mirror->push_back(std::move(m));
                 if (std::getenv("STRATA_RESUME_TRACE") != nullptr)
-                    std::fprintf(stderr, "strata resume-trace: mirrored ck %lld into the slot (%lld checks)\n",
-                                 (long long) m.ids.size(), (long long) slot_checks_mirror->size());
+                    std::fprintf(stderr, "strata resume-trace: mirrored ck %lld into the slot (%zu checks)\n",
+                                 (long long) mirror_len, mirror_count);
             }
+            checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
                 std::vector<uint64_t> stamps;
                 std::vector<char> is_tail;
@@ -9320,7 +9339,12 @@ int main(int argc, char **argv) try {
                 }
                 admit_slot = (int) b;
                 admit_max_new = mn;
-                slot_checks_mirror = bimg ? nullptr : &bs[(size_t) b].checks;   // #1906: the read's checkpoints stay with the slot
+                // #1906: the read's checkpoints stay with the slot, but only when the message-boundary scan is
+                // on - that scan is what makes the slot's mirrors useful to a later request (it finds the
+                // boundary inside the shared context, not just the turn end). With the env off, mirroring wastes
+                // a state copy per checkpoint per stage and grows slot.checks with each read.
+                slot_checks_mirror = (bimg || !message_boundary_opt_in())
+                    ? nullptr : &bs[(size_t) b].checks;
                 line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
             }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
@@ -10544,12 +10568,8 @@ int main(int argc, char **argv) try {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
-            static const bool message_checkpoint = [] {
-                const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
-                return e != nullptr && std::atoi(e) != 0;
-            }();
             // Only add a snapshot; the existing token and image checks still decide reuse.
-            const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
+            const int64_t message_at = message_boundary_opt_in() && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token,
                                                                8192, 16384) : -1;
             int64_t at = read_from;
