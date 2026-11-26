@@ -466,6 +466,45 @@ All are environment variables for the engine. Put them in the config's `"env"` b
 | `STRATA_SYCL_GEMM_STAGE=1` | Off on Battlemage | Stage GEMM operands past 4 GiB |
 | `STRATA_I8_NO_ESIMD` | n/a | Compile-time: stubs for the int8 ESIMD kernels (set for a device without them) |
 | `STRATA_DBG_NAN=1` | Off | Report non-finite values, including the experts' FP16 inputs |
+| `STRATA_HC_Q8=1` | Off | Read the hyper-connection down / up projections as Q8_0 in the verify window; the bf16 copies are skipped (see below) |
+| `STRATA_HC_NO_SKIP=1` | Off | With `STRATA_HC_Q8=1`: keep the bf16 copies too (the comparison arm; costs VRAM) |
+
+### Hyper-connection projections as Q8_0 (`STRATA_HC_Q8`)
+
+Each layer reads four hyper-connection projections per half: a norm (F32) and the `down` / `up` pair (BF16). This switch
+keeps only a Q8_0 copy of the `down` / `up` pair and reads that in the verify window, and re-builds the BF16 values into
+one scratch matrix per slot for the two paths that have no Q8_0 read (the prompt path's GEMMs and the layer read). The
+final mixer (`output_hc_*`) keeps its BF16 copy: it runs once a window.
+
+For Flash-Next the pair is 194 tensors and 1.21 GiB as BF16, 0.63 GiB as Q8_0. The scratch is 25.0 MiB (four buffers,
+one matrix each). So the switch gives VRAM back instead of taking it: the card loses 1.21 GiB of BF16, keeps 0.63 GiB
+of Q8_0 and gains 25.0 MiB of scratch, and the expert cache grows by 205 slots.
+
+The read is not bitwise with the BF16 one: the weights enter as Q8_0 values (`d * q`, exact in FP32), and the prompt
+path's GEMMs then read a BF16 view of those same values. Expect different text, by the rounding, not by a kernel
+difference.
+
+Measured on one Arc Pro B70 (Qwen3.8-Flash-Next GSQ-RCO IQ3_S, 32K context, `--batch 2 --spec 4 --batch-mtp`
+`--resident-experts`, greedy, two fixed 220-token prompts, two samples each, one request in flight, oneAPI 2026.2;
+decode is at parity between the 2026.1 and 2026.2 toolchains on this engine, prefill is not, and this table is decode):
+
+| Arm | Expert slots | Expert cache | Decode |
+| --- | --- | --- | --- |
+| default (BF16) | 10,889 | 20.67 GiB | 49.3 tok/s |
+| `STRATA_HC_Q8=1 STRATA_HC_NO_SKIP=1` | 10,493 | 19.91 GiB | 52.7 tok/s (+6.9%) |
+| `STRATA_HC_Q8=1` | 11,094 | 21.06 GiB | 54.9 tok/s (+11.4%) |
+
+The skip is the larger half of the gain because the VRAM it frees becomes expert-cache hits (90.3% of the routed experts
+against 87.0% with the BF16 copies kept).
+
+On the production shape (one B70, IQ3_S, 512K context, `--batch 2 --spec 4`, oneAPI 2026.1 in the runtime image) the
+same switch with the flag off holds 11,589 expert slots (22.00 GiB, 500 MiB free) and 63.2 tok/s on a 220-token
+answer; with `STRATA_HC_Q8=1` it holds 11,792 slots (22.39 GiB) and 68.3 tok/s. So the flag is worth about three
+percent of the expert cache and eight percent of decode there, and it does not refuse at 512K: the footprint falls
+instead of rising. The parity test (`build-sycl/gr_q8_parity --selftest`) compares the Q8_0 read against
+an FP64 reference on its own Q8_0 values (worst relative error 2.4e-07 over 32 cases of T 1..8 x pending write x inject),
+checks that `R_out` is bitwise the BF16 read's, that a captured graph replays bitwise, that rows off the callers' fixed
+strides fall back to the BF16 read bitwise, and that the BF16 view reproduces the Q8_0 values exactly.
 
 ## History / older measurements
 

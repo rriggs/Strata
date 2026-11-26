@@ -482,7 +482,7 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
     add_test(NAME bmg_gate_up_parity COMMAND bmg_gate_up_parity)
     set_tests_properties(bmg_gate_up_parity PROPERTIES SKIP_RETURN_CODE 77)
   endif()
-  foreach(p IN ITEMS dequant_s2 s2_gemv shared_expert gr gdn s2_gemv_q8 sampler rope quantize_act router_top10
+  foreach(p IN ITEMS dequant_s2 s2_gemv shared_expert gr gr_q8 gdn s2_gemv_q8 sampler rope quantize_act router_top10
                      s_gemv elementwise bf16_gemv s_gemv_q8k qsa kv_q8 kv_stream kv_q4 cvec)
     strata_resolve(_src src/kernels/${p}_parity.cpp)
     add_executable(${p}_parity ${_src})

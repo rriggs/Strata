@@ -149,6 +149,7 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
     const std::string path = pack_dir + "/index.txt";
     std::FILE* idx = std::fopen(path.c_str(), "rb");
     if (!idx) { err = "cannot open " + path + " (run tools/pack_index.py)"; return false; }
+    pack_dir_ = pack_dir;   // read_bf16_host opens the rows the arena skipped (STRATA_HC_Q8 without a bf16 copy)
 
     uint64_t pool = 0;
     int align = 0;
@@ -529,6 +530,38 @@ catch (sycl::exception const &exc) {
 const WeightRef* WeightTable::find(const std::string& name) const {
     const auto it = table_.find(name);
     return it == table_.end() ? nullptr : &it->second;
+}
+
+
+// STRATA_HC_Q8 without a bf16 copy: a skipped row's bf16 values straight from the pack file (the CUDA engine's
+// method, same rules).  The row keeps its metadata when `skip` drops it from the arena, so this is the only way to
+// quantize it to Q8_0 without loading the bf16 copy.  `out` receives bf16 bit patterns.
+bool WeightTable::read_bf16_host(const std::string& name, std::vector<uint16_t>& out, std::string& err) const {
+    const auto it = table_.find(name);
+    if (it == table_.end()) { err = name + ": no such tensor"; return false; }
+    const WeightRef& r = it->second;
+    const char* fn = file_name(r.file_id);
+    if (fn == nullptr || r.kind != WeightKind::Bf16InF32) { err = name + ": not a bf16 row of a pack file"; return false; }
+    const uint64_t elems = (uint64_t) r.elements;
+    const bool raw16 = r.src_bytes == elems * 2;
+    if (!raw16 && r.src_bytes != elems * 4) { err = name + ": unexpected source size"; return false; }
+    std::FILE* f = std::fopen((pack_dir_ + "/" + fn).c_str(), "rb");
+    if (!f) { err = "cannot open " + pack_dir_ + "/" + fn; return false; }
+    out.resize((size_t) elems);
+    bool ok = true;
+    if (raw16) {
+        ok = read_at(f, r.src_off, out.data(), (size_t) (elems * 2), err, name.c_str());
+    } else {
+        std::vector<uint32_t> tmp((size_t) (std::min<uint64_t>)(elems, 1u << 22));
+        for (uint64_t done = 0; ok && done < elems;) {
+            const uint64_t n = (std::min<uint64_t>)(tmp.size(), elems - done);
+            ok = read_at(f, r.src_off + done * 4, tmp.data(), (size_t) (n * 4), err, name.c_str());
+            for (uint64_t i = 0; ok && i < n; ++i) out[(size_t) (done + i)] = (uint16_t) (tmp[(size_t) i] >> 16);
+            done += n;
+        }
+    }
+    std::fclose(f);
+    return ok;
 }
 
 }  // namespace strata::core

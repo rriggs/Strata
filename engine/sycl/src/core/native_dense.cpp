@@ -7,6 +7,8 @@
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/fused_gr_q8.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <algorithm>
@@ -34,6 +36,23 @@ bool in_range(const std::string& name) {
 bool hc_q8_env() {
     static const bool on = [] { const char* v = std::getenv("STRATA_HC_Q8"); return v != nullptr && v[0] == '1'; }();
     return on;
+}
+// STRATA_HC_Q8 without a bf16 copy: the bf16 views' scratch, one matrix per (device, class, slot).  Allocated by
+// `load` (never on first use: a graph capture must not meet the allocation).
+struct HcScratch {
+    explicit HcScratch(const sycl::device& d) : dev(d) {}
+    sycl::device dev;        // sycl::device has no default constructor
+    void* buf[2][2] = {};    // [class][slot]
+    sycl::event ev[2];       // [slot]: the prompt path's last reader of the slot
+    bool ev_set[2] = {};
+};
+std::mutex g_hc_mu;
+std::vector<HcScratch>* g_hc_table = nullptr;
+HcScratch* hc_slot(const sycl::device& d) {
+    if (g_hc_table == nullptr) return nullptr;
+    for (auto& e : *g_hc_table)
+        if (e.dev == d) return &e;
+    return nullptr;
 }
 bool hc_q8_name(const std::string& name) {
     if (name == "output_hc_down.weight" || name == "output_hc_up.weight") return true;   // S25: the final mixer too
@@ -390,38 +409,59 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 }
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
             }
+            // STRATA_HC_Q8=1: the hyper-connection down / up projections (the layers' and the final mixer's) as Q8_0 for
+            // fused_gr_read_multi's Q8_0 read: the GGUF's own Q8_0 blocks (type 8, the Unsloth files), or Q8_0 of the
+            // GGUF's BF16 values (type 30, the ISTA files; ggml's reference rounding, on the host).  Uploaded in the
+            // read's split layout (fused_gr_q8_0_split_host).  The inject rows are not copied: the read takes the
+            // pack's BF16 ones, so STRATA_HC_Q8_INJECT has no effect here.  Unless the BF16 copy is skipped
+            // (add_hc_skip, the single-GPU default) the BF16 copies stay in the arena for the prompt path's GEMMs and
+            // the Q8_0 copies are extra VRAM; with the skip they are the only copy and hc_bf16_view re-dequantizes.
             if (hc_q8_requested())
                 for (const auto& tensor : gguf.tensors()) {
-                    // S25: the F32 inject rows hold BF16-exact values: the read takes the pack's BF16 rows unless
-                    // STRATA_HC_Q8_INJECT=1 asks for a Q8_0 copy
-                    static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
-                    const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
-                    if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
+                    if ((tensor.type != 8 && tensor.type != 30) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2 ||
+                        tensor.name.ends_with("_inject.weight") || !in_range(tensor.name)) continue;
                     auto found = table.table_.find(tensor.name);
                     if (found == table.table_.end() || found->second.hc_q8 != nullptr) continue;
                     auto& ref = found->second;
                     if (tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1 || ref.ne0 % 32 != 0) {
                         err = "native dense (STRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
                     }
-                    const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
-                    void* p = nullptr;
+                    // the read is compiled for the model geometry (hc_lr rows of hc * n_embd, or the transpose)
+                    constexpr int64_t hc_dim = strata::core::kCompiledGeometry.hc_dim(), hc_lr = strata::core::kCompiledGeometry.hc_lr;
+                    if (!((ref.ne0 == hc_dim && ref.ne1 == hc_lr) || (ref.ne0 == hc_lr && ref.ne1 == hc_dim))) {
+                        err = "native dense (STRATA_HC_Q8): " + tensor.name + " is not a hyper-connection projection of the compiled geometry";
+                        return false;
+                    }
+                    const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1, bytes = n / 32 * 34;
                     std::vector<uint8_t> q8;
-                    if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
+                    const uint8_t* blocks = nullptr;
+                    if (ref.data == nullptr) {
+                        // the BF16 copy was skipped (add_hc_skip): quantize the pack's row on the host
+                        std::vector<uint16_t> host;
+                        if (!table.read_bf16_host(tensor.name, host, err)) return false;
+                        std::vector<float> f(host.size());
+                        for (size_t i = 0; i < host.size(); ++i) {
+                            const uint32_t u = (uint32_t) host[i] << 16;
+                            std::memcpy(&f[i], &u, 4);
+                        }
+                        q8 = q8_0_of(f.data(), (uint64_t) f.size());
+                        blocks = q8.data();
+                    } else if (tensor.type == 30) {
+                        const uint16_t* src = (const uint16_t*) gguf.tensor_data(tensor);
+                        std::vector<float> f((size_t) n);
+                        for (uint64_t i = 0; i < n; ++i) { const uint32_t u = (uint32_t) src[i] << 16; std::memcpy(&f[i], &u, 4); }
+                        q8 = q8_0_of(f.data(), n);
+                        blocks = q8.data();
+                    } else {
+                        blocks = (const uint8_t*) gguf.tensor_data(tensor);
+                    }
+                    std::vector<uint8_t> split((size_t) bytes);
+                    strata::kernels::fused_gr_q8_0_split_host(blocks, split.data(), ref.ne1, ref.ne0);
+                    void* p = nullptr;
                     if (DPCT_CHECK_ERROR(
                             p = (void *)strata::malloc_device_guarded(
                                 bytes, dpct::get_in_order_queue())) != 0 ||
-                        /*
-                        DPCT1114: cudaMemcpy is migrated to
-                        asynchronization memcpy, assuming in the original code
-                        the source host memory is pageable memory. If the memory
-                        is not pageable, call wait() on event return by memcpy
-                        API to ensure synchronization behavior.
-                        */
-                        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                            p,
-                            f32_inject ? (const void *)q8.data()
-                                       : gguf.tensor_data(tensor),
-                            bytes).wait()) != 0) {
+                        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(p, split.data(), bytes).wait()) != 0) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
                     ref.hc_q8 = p;
@@ -477,6 +517,31 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                          packed_count, packed_bytes / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
+        if (hc_q8_requested()) {
+            // the scratches of hc_bf16_view (the rows without a bf16 copy), here and not on first use: a graph
+            // capture must not meet the allocation
+            int64_t elems = 0;
+            for (const auto& kv : table.table_)
+                if (kv.second.hc_q8 != nullptr && kv.second.data == nullptr)
+                    elems = (std::max)(elems, (int64_t) kv.second.elements);
+            if (elems != 0) {
+                auto q = dpct::get_in_order_queue();
+                std::lock_guard<std::mutex> lk(g_hc_mu);
+                if (g_hc_table == nullptr) g_hc_table = new std::vector<HcScratch>();
+                if (hc_slot(q.get_device()) == nullptr) {
+                    HcScratch e(q.get_device());
+                    for (int c = 0; c < 2; ++c)
+                        for (int s = 0; s < 2; ++s) {
+                            e.buf[c][s] = strata::malloc_device_guarded((size_t) elems * 2, q);
+                            if (e.buf[c][s] == nullptr) { err = "native dense (STRATA_HC_Q8): scratch alloc"; return false; }
+                            weights_.push_back(e.buf[c][s]);
+                        }
+                    g_hc_table->push_back(e);
+                    std::fprintf(stderr, "strata: STRATA_HC_Q8=1 without the bf16 copies: %.1f MiB of bf16 view scratch\n",
+                                 (double) elems * 2 * 4 / 1048576.0);
+                }
+            }
+        }
         if (hc_q8_requested())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);
@@ -491,4 +556,78 @@ catch (sycl::exception const &exc) {
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
 }
+
+// ---- STRATA_HC_Q8 without a bf16 copy (add_hc_skip): the CUDA engine's design, ported.  The projections live only as
+// Q8_0 (the verify read's split layout); the prompt path's GEMMs and the layer read get a bf16 view of them, one
+// matrix of scratch per (device, class, slot).  `cls` 0 = the prompt path (its streams share the pair, ordered by
+// events: hc_bf16_release after the last GEMM that reads the slot), 1 = the layer / session read (its own pair: it is
+// captured into graphs, where a wait on an outside event is illegal).
+bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip) {
+    std::FILE* f = std::fopen((pack_dir + "/index.txt").c_str(), "rb");
+    if (!f) return false;
+    char line[1024], name[256];
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
+        const std::string n = name;
+        // "blk." only: the final mixer (output_hc_down / up) stays bf16 - it runs once a window
+        if (n.rfind("blk.", 0) == 0 && hc_q8_name(n) && (n.ends_with("_down.weight") || n.ends_with("_up.weight"))) skip.insert(n);
+    }
+    std::fclose(f);
+    return true;
+}
+
+bool NativeDense::gguf_carries_q8_hc(const std::vector<std::string>& shards) {
+    try {
+        for (const auto& path : shards) {
+            const strata::GgufFile g(path);
+            for (const auto& tensor : g.tensors())
+                if (tensor.type == 8 && tensor.shape.size() == 2 && hc_q8_name(tensor.name) && !tensor.name.ends_with("_inject.weight")) return true;
+        }
+    } catch (const std::exception&) {}
+    return false;
+}
+
+bool NativeDense::apply_hc_q8_default(const std::vector<std::string>& shards) {
+    if (std::getenv("STRATA_HC_Q8") != nullptr || !gguf_carries_q8_hc(shards)) return false;
+    setenv("STRATA_HC_Q8", "1", 0);
+    return true;
+}
+
+const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int slot, int cls) {
+    if (w.data != nullptr) return (const uint16_t*) w.data;
+    if (w.hc_q8 == nullptr) return nullptr;
+    auto* q = strata::q_of(stream);
+    if (q == nullptr || slot < 0 || slot > 1 || cls < 0 || cls > 1) return nullptr;
+    HcScratch* e = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_hc_mu);
+        e = hc_slot(q->get_device());
+    }
+    if (e == nullptr) return nullptr;
+    void* buf = e->buf[cls][slot];
+    if (buf == nullptr) return nullptr;
+    // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots'
+    // prompts).  The layer read (cls 1) never waits here: its own pair, and the wait would land in a captured graph.
+    if (cls == 0 && e->ev_set[slot]) {
+        const sycl::event dep = e->ev[slot];
+        q->submit([&](sycl::handler& h) { h.depends_on(dep); });
+    }
+    strata::kernels::fused_gr_q8_0_split_to_bf16((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.ne1, w.ne0, stream);
+    return (const uint16_t*) buf;
+}
+
+void NativeDense::hc_bf16_release(void* stream, int slot, int cls) {
+    if (cls != 0 || slot < 0 || slot > 1) return;
+    auto* q = strata::q_of(stream);
+    if (q == nullptr) return;
+    HcScratch* e = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_hc_mu);
+        e = hc_slot(q->get_device());
+    }
+    if (e == nullptr) return;
+    e->ev[slot] = q->submit([&](sycl::handler& h) { h.host_task([] {}); });
+    e->ev_set[slot] = true;
+}
+
 } // namespace strata::core

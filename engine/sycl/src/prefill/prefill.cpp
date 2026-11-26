@@ -38,6 +38,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -3434,6 +3435,18 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
+                // STRATA_HC_Q8 without a bf16 copy: this path's GEMMs read bf16, so the half's projections are
+                // dequantized into the prompt path's scratch (released after the last GEMM that reads them)
+                core::WeightRef wd_q8, wu_q8;
+                bool hc_view = false;
+                if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
+                    hc_view = true;
+                    wd_q8 = *wd; wu_q8 = *wu;
+                    wd_q8.data = core::NativeDense::hc_bf16_view(*wd, m.cs, 0, 0);
+                    wu_q8.data = core::NativeDense::hc_bf16_view(*wu, m.cs, 1, 0);
+                    if (!wd_q8.data || !wu_q8.data) { err = "prefill: the Q8_0 hyper-connection projections could not be dequantized"; return false; }
+                    wd = &wd_q8; wu = &wu_q8;
+                }
                 pt.mark(kPfHc, cs);
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
@@ -3509,6 +3522,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                              m.mixed_bf_lo);
                 }
 
+                if (hc_view) { core::NativeDense::hc_bf16_release(m.cs, 0, 0); core::NativeDense::hc_bf16_release(m.cs, 1, 0); }
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),

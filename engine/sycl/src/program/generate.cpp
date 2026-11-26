@@ -3082,6 +3082,16 @@ int main(int argc, char **argv) try {
             return 1;
         }
         if (native_pack) skip.insert("token_embd.weight");
+        // STRATA_HC_Q8=1 (single GPU): the layers' hyper-connection down / up projections live only as Q8_0
+        // (NativeDense quantizes them from the pack file), so their bf16 copy is not loaded; the prompt path and the
+        // layer read get a bf16 view of the Q8_0 copy instead (hc_bf16_view).  STRATA_HC_NO_SKIP=1 keeps the bf16
+        // copies (the A/B arm that shows what the skip saves).
+        static const bool hc_no_skip = [] { const char* v = std::getenv("STRATA_HC_NO_SKIP"); return v != nullptr && v[0] != 0 && std::string(v) != "0"; }();
+        if (!o.native_dense_gguf.empty() && !multi_gpu && !hc_no_skip && strata::core::NativeDense::hc_q8_requested() &&
+            !strata::core::NativeDense::add_hc_skip(o.pack, skip)) {
+            std::fprintf(stderr, "strata generate: %s/index.txt could not be read for STRATA_HC_Q8\n", o.pack.c_str());
+            return 1;
+        }
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
